@@ -30,17 +30,16 @@ private:
     
     std::vector<void*> buffers;
     std::vector<std::string> tensor_names;
+    std::vector<size_t> tensor_sizes;
     cudaStream_t stream;
     
-    // 动态获取的参数
-    nvinfer1::Dims input_dims;
-    nvinfer1::Dims output_dims;
+    // 模型参数
     int input_size = 640;
     int num_classes = 80;
-    int output_size = 25200;
-    size_t input_size_bytes = 0;
-    size_t output_size_bytes = 0;
     bool initialized = false;
+    
+    // 输出相关
+    int main_output_idx = -1;  // 主输出张量索引
     
     // COCO类别名称
     std::vector<std::string> class_names = {
@@ -96,34 +95,15 @@ private:
         size_t size = file.tellg();
         file.seekg(0, file.beg);
         
-        if (size == 0) {
-            std::cerr << "引擎文件为空" << std::endl;
-            return false;
-        }
-        
         std::vector<char> modelStream(size);
         file.read(modelStream.data(), size);
         file.close();
         
         runtime.reset(nvinfer1::createInferRuntime(gLogger));
-        if (!runtime) {
-            std::cerr << "创建runtime失败" << std::endl;
-            return false;
-        }
-        
         engine.reset(runtime->deserializeCudaEngine(modelStream.data(), size));
-        if (!engine) {
-            std::cerr << "反序列化引擎失败" << std::endl;
-            return false;
-        }
-        
         context.reset(engine->createExecutionContext());
-        if (!context) {
-            std::cerr << "创建execution context失败" << std::endl;
-            return false;
-        }
         
-        return true;
+        return engine && context;
     }
     
     bool analyzeEngine() {
@@ -134,13 +114,12 @@ private:
         
         buffers.resize(num_io_tensors);
         tensor_names.resize(num_io_tensors);
+        tensor_sizes.resize(num_io_tensors);
         
-        // 分析所有输入输出张量
         for (int i = 0; i < num_io_tensors; ++i) {
             const char* name = engine->getIOTensorName(i);
             tensor_names[i] = std::string(name);
             nvinfer1::Dims dims = engine->getTensorShape(name);
-            nvinfer1::DataType dtype = engine->getTensorDataType(name);
             bool is_input = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
             
             std::cout << "张量 " << i << ": " << name 
@@ -158,34 +137,33 @@ private:
                 tensor_size *= dims.d[j];
             }
             tensor_size *= sizeof(float);
+            tensor_sizes[i] = tensor_size;
             
-            if (is_input) {
-                input_dims = dims;
-                if (dims.nbDims == 4) { // NCHW
-                    input_size = dims.d[2]; // H
+            // 找到主输出张量
+            if (!is_input) {
+                if (std::string(name) == "output" || 
+                    (dims.nbDims == 3 && dims.d[1] == 25200 && dims.d[2] == 85)) {
+                    main_output_idx = i;
+                    std::cout << "  >>> 这是主输出张量 <<<" << std::endl;
                 }
-                input_size_bytes = tensor_size;
-                std::cout << "  输入尺寸: " << input_size << "x" << input_size << std::endl;
-                std::cout << "  输入字节大小: " << input_size_bytes << std::endl;
-            } else {
-                output_dims = dims;
-                output_size_bytes = tensor_size;
-                
-                // 根据输出维度推断格式
-                if (dims.nbDims == 3) { // [1, num_detections, 85]
-                    output_size = dims.d[1];
-                    num_classes = dims.d[2] - 5;
-                } else if (dims.nbDims == 2) { // [num_detections, 85]
-                    output_size = dims.d[0];
-                    num_classes = dims.d[1] - 5;
+            }
+            
+            std::cout << "  字节大小: " << tensor_size << std::endl;
+        }
+        
+        if (main_output_idx == -1) {
+            std::cerr << "警告: 未找到主输出张量，使用第一个输出" << std::endl;
+            // 第一个输出张量
+            for (int i = 0; i < num_io_tensors; ++i) {
+                const char* name = tensor_names[i].c_str();
+                if (engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT) {
+                    main_output_idx = i;
+                    break;
                 }
-                
-                std::cout << "  输出数量: " << output_size << std::endl;
-                std::cout << "  类别数量: " << num_classes << std::endl;
-                std::cout << "  输出字节大小: " << output_size_bytes << std::endl;
             }
         }
         
+        std::cout << "使用输出张量索引: " << main_output_idx << std::endl;
         std::cout << "=== 分析完成 ===\n" << std::endl;
         return true;
     }
@@ -194,24 +172,17 @@ private:
         std::cout << "分配GPU内存..." << std::endl;
         
         for (size_t i = 0; i < buffers.size(); ++i) {
-            const char* name = tensor_names[i].c_str();
-            bool is_input = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
-            
-            size_t size = is_input ? input_size_bytes : output_size_bytes;
-            
-            cudaError_t err = cudaMalloc(&buffers[i], size);
+            cudaError_t err = cudaMalloc(&buffers[i], tensor_sizes[i]);
             if (err != cudaSuccess) {
-                std::cerr << "分配GPU内存失败 [" << name << "]: " 
+                std::cerr << "分配GPU内存失败 [" << tensor_names[i] << "]: " 
                           << cudaGetErrorString(err) << std::endl;
-                // 清理已分配的内存
-                for (size_t j = 0; j < i; ++j) {
-                    if (buffers[j]) cudaFree(buffers[j]);
-                }
                 return false;
             }
             
+            const char* name = tensor_names[i].c_str();
+            bool is_input = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
             std::cout << "  " << (is_input ? "输入" : "输出") 
-                      << " [" << name << "]: " << size << " 字节" << std::endl;
+                      << " [" << tensor_names[i] << "]: " << tensor_sizes[i] << " 字节" << std::endl;
         }
         
         std::cout << "GPU内存分配成功" << std::endl;
@@ -245,8 +216,8 @@ public:
     }
     
     std::vector<Detection> detect(const cv::Mat& image) {
-        if (!initialized) {
-            std::cerr << "检测器未初始化" << std::endl;
+        if (!initialized || main_output_idx == -1) {
+            std::cerr << "检测器未正确初始化" << std::endl;
             return {};
         }
         
@@ -254,26 +225,36 @@ public:
         cv::Mat processed = preprocess(image, x_scale, y_scale);
         
         // 准备输入数据
-        std::vector<float> input_data(input_size_bytes / sizeof(float));
+        std::vector<float> input_data(input_size * input_size * 3);
         
         // 填充数据 - NCHW格式
-        if (input_dims.nbDims == 4) {
-            int idx = 0;
-            for (int c = 0; c < 3; ++c) {
-                for (int h = 0; h < input_size; ++h) {
-                    for (int w = 0; w < input_size; ++w) {
-                        input_data[idx++] = processed.at<cv::Vec3f>(h, w)[2-c]; // BGR to RGB
-                    }
+        int idx = 0;
+        for (int c = 0; c < 3; ++c) {
+            for (int h = 0; h < input_size; ++h) {
+                for (int w = 0; w < input_size; ++w) {
+                    input_data[idx++] = processed.at<cv::Vec3f>(h, w)[2-c]; // BGR to RGB
                 }
             }
-        } else {
-            std::cerr << "不支持的输入维度格式" << std::endl;
+        }
+        
+        // 找到输入张量索引
+        int input_idx = -1;
+        for (size_t i = 0; i < tensor_names.size(); ++i) {
+            const char* name = tensor_names[i].c_str();
+            if (engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT) {
+                input_idx = i;
+                break;
+            }
+        }
+        
+        if (input_idx == -1) {
+            std::cerr << "未找到输入张量" << std::endl;
             return {};
         }
         
         // 复制数据到GPU
-        cudaError_t err = cudaMemcpyAsync(buffers[0], input_data.data(), 
-                                         input_size_bytes, 
+        cudaError_t err = cudaMemcpyAsync(buffers[input_idx], input_data.data(), 
+                                         tensor_sizes[input_idx], 
                                          cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
             std::cerr << "数据复制到GPU失败: " << cudaGetErrorString(err) << std::endl;
@@ -295,26 +276,11 @@ public:
             return {};
         }
         
-        // 获取输出数据
-        std::vector<float> output_data(output_size_bytes / sizeof(float));
+        // 获取主输出数据
+        std::vector<float> output_data(tensor_sizes[main_output_idx] / sizeof(float));
         
-        // 找到输出缓冲区（通常是最后一个）
-        void* output_buffer = nullptr;
-        for (size_t i = 0; i < tensor_names.size(); ++i) {
-            const char* name = tensor_names[i].c_str();
-            if (engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT) {
-                output_buffer = buffers[i];
-                break;
-            }
-        }
-        
-        if (!output_buffer) {
-            std::cerr << "未找到输出缓冲区" << std::endl;
-            return {};
-        }
-        
-        err = cudaMemcpyAsync(output_data.data(), output_buffer, 
-                             output_size_bytes, 
+        err = cudaMemcpyAsync(output_data.data(), buffers[main_output_idx], 
+                             tensor_sizes[main_output_idx], 
                              cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) {
             std::cerr << "数据从GPU复制失败: " << cudaGetErrorString(err) << std::endl;
@@ -322,6 +288,18 @@ public:
         }
         
         cudaStreamSynchronize(stream);
+        
+        // 调试输出
+        std::cout << "输出数据大小: " << output_data.size() << std::endl;
+        
+        // 检查前几个输出值
+        if (output_data.size() >= 10) {
+            std::cout << "前10个输出值: ";
+            for (int i = 0; i < 10; ++i) {
+                std::cout << output_data[i] << " ";
+            }
+            std::cout << std::endl;
+        }
         
         // 后处理
         return postprocess(output_data, x_scale, y_scale);
@@ -333,17 +311,31 @@ public:
         std::vector<float> confidences;
         std::vector<int> class_ids;
         
-        int stride = num_classes + 5; // x,y,w,h,conf + classes
+        // YOLOv5输出格式：[1, 25200, 85] 其中85 = 4(坐标) + 1(置信度) + 80(类别)
+        int num_detections = 25200;
+        int num_features = 85;
         
-        for (int i = 0; i < output_size; ++i) {
-            int offset = i * stride;
+        // 确保输出数据大小正确
+        if (output.size() < num_detections * num_features) {
+            std::cerr << "输出数据大小不匹配: " << output.size() 
+                      << " < " << (num_detections * num_features) << std::endl;
+            return {};
+        }
+        
+        std::cout << "开始后处理，检测数量: " << num_detections << std::endl;
+        
+        int valid_detections = 0;
+        for (int i = 0; i < num_detections; ++i) {
+            int offset = i * num_features;
             
-            if (offset + stride > (int)output.size()) {
-                break;
-            }
-            
+            // YOLOv5格式：cx, cy, w, h, confidence, class_probs...
+            float cx = output[offset + 0];
+            float cy = output[offset + 1];
+            float w = output[offset + 2];
+            float h = output[offset + 3];
             float confidence = output[offset + 4];
-            if (confidence < 0.25) continue; // 降低阈值
+            
+            if (confidence < 0.25) continue; // 置信度阈值
             
             // 找到最大类别概率
             float max_class_score = 0;
@@ -357,28 +349,32 @@ public:
             }
             
             float final_confidence = confidence * max_class_score;
-            if (final_confidence < 0.3) continue; // 降低阈值
+            if (final_confidence < 0.3) continue; // 最终置信度阈值
             
-            float x = output[offset + 0] * x_scale;
-            float y = output[offset + 1] * y_scale;
-            float w = output[offset + 2] * x_scale;
-            float h = output[offset + 3] * y_scale;
+            valid_detections++;
             
-            int left = x - w / 2;
-            int top = y - h / 2;
+            // 转换坐标（从中心点到左上角）
+            float x = (cx - w / 2) * x_scale;
+            float y = (cy - h / 2) * y_scale;
+            w *= x_scale;
+            h *= y_scale;
             
-            // 确保边界框在图像范围内
-            if (left >= 0 && top >= 0 && w > 0 && h > 0) {
-                boxes.push_back(cv::Rect(left, top, w, h));
+            // 确保边界框有效
+            if (x >= 0 && y >= 0 && w > 0 && h > 0) {
+                boxes.push_back(cv::Rect(x, y, w, h));
                 confidences.push_back(final_confidence);
                 class_ids.push_back(class_id);
             }
         }
         
+        std::cout << "有效检测数量: " << valid_detections << std::endl;
+        std::cout << "通过边界检查的检测数量: " << boxes.size() << std::endl;
+        
         // NMS
         std::vector<int> indices;
         if (!boxes.empty()) {
             cv::dnn::NMSBoxes(boxes, confidences, 0.3, 0.4, indices);
+            std::cout << "NMS后的检测数量: " << indices.size() << std::endl;
         }
         
         std::vector<Detection> detections;
@@ -433,7 +429,14 @@ void processImage(YOLOv5TensorRT& detector, const std::string& image_path) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "检测到 " << detections.size() << " 个目标，推理时间: " << duration.count() << "ms" << std::endl;
     
-    detector.drawDetections(image, detections);
+    if (detections.size() > 0) {
+        detector.drawDetections(image, detections);
+        
+        // 保存结果
+        std::string output_path = "detection_result.jpg";
+        cv::imwrite(output_path, image);
+        std::cout << "检测结果已保存到: " << output_path << std::endl;
+    }
     
     cv::imshow("YOLOv5 Detection", image);
     cv::waitKey(0);
@@ -456,10 +459,25 @@ void processVideo(YOLOv5TensorRT& detector, const std::string& video_path) {
         return;
     }
     
+    // 获取视频信息
+    int fps = cap.get(cv::CAP_PROP_FPS);
+    int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    std::cout << "视频信息: " << width << "x" << height << " @ " << fps << "fps" << std::endl;
+    
     cv::Mat frame;
     int frame_count = 0;
     int success_count = 0;
     auto total_start = std::chrono::high_resolution_clock::now();
+    
+    // 先测试一帧
+    cap >> frame;
+    if (!frame.empty()) {
+        std::cout << "测试第一帧..." << std::endl;
+        std::vector<Detection> test_detections = detector.detect(frame);
+        std::cout << "第一帧测试完成，检测到 " << test_detections.size() << " 个目标" << std::endl;
+        cap.set(cv::CAP_PROP_POS_FRAMES, 0); // 重置到开始
+    }
     
     while (true) {
         cap >> frame;
@@ -493,7 +511,7 @@ void processVideo(YOLOv5TensorRT& detector, const std::string& video_path) {
         char key = cv::waitKey(1) & 0xFF;
         if (key == 'q' || key == 27) break;
         
-        // 限制处理速度以便观察
+        // 每10帧输出一次状态
         if (frame_count % 10 == 0) {
             std::cout << "已处理 " << frame_count << " 帧，检测成功 " << success_count << " 帧" << std::endl;
         }

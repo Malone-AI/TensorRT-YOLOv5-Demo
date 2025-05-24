@@ -13,7 +13,7 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${CUDA_INCLUDE_DIRS})
 include_directories(/usr/include/x86_64-linux-gnu)
 
-# 添加可执行文件
+# 可执行文件
 add_executable(detect detect.cpp)
 
 # 链接库
@@ -23,7 +23,3 @@ target_link_libraries(detect
     nvinfer
     cudart
 )
-
-# 输出信息
-message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "CUDA version: ${CUDA_VERSION}")
