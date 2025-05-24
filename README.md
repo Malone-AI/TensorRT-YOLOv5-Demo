@@ -39,7 +39,7 @@ demo/
 
 ### 1. 克隆项目
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Malone-AI/TensorRT-YOLOv5-Demo.git
 cd tensorrtDemo/code_for_student/demo
 ```
 
