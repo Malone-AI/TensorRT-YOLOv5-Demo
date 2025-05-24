@@ -4,7 +4,7 @@ project(YOLOv5_Inference)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-# 查找必要的包
+# 必要的库
 find_package(OpenCV REQUIRED)
 find_package(CUDA REQUIRED)
 
