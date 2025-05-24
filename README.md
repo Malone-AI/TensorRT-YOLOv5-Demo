@@ -30,8 +30,6 @@ demo/
 ├── CMakeLists.txt          # CMake构建配置
 ├── convert_to_engine.py    # ONNX到TensorRT引擎转换脚本
 ├── detect.cpp              # C++推理代码
-├── yolov5s.onnx           # YOLOv5 ONNX模型文件
-├── yolov5s.engine         # TensorRT引擎文件
 └── README.md              # 本文档
 ```
 
@@ -40,7 +38,6 @@ demo/
 ### 1. 克隆项目
 ```bash
 git clone https://github.com/Malone-AI/TensorRT-YOLOv5-Demo.git
-cd tensorrtDemo/code_for_student/demo
 ```
 
 ### 2. 模型转换（可选）
