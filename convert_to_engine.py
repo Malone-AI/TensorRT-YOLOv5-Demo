@@ -64,7 +64,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type = str)
     parser.add_argument("--output", type = str)
+    parser.add_argument("--precision", type=str, default='fp16')
     args = parser.parse_args()
     if not args.output:
         args.output = str(Path(args.input).stem) + ".engine"
-    onnx_to_engine(args.input, args.output)
+    onnx_to_engine(args.input, args.output, args.precision)
